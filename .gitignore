@@ -4,6 +4,8 @@
 !.env.example
 !.gitignore
 !.github/
+!.cursor/
+!.cursor/**
 
 # 敏感文件
 *.pem
