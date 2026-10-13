@@ -525,10 +525,29 @@ func (m *SessionBoundManager) WriteSessionInputFile(
 	if err != nil {
 		return err
 	}
-	handle, err := m.resolveSession(ctx, sessionID)
-	if err != nil {
-		return err
+	var handle RemoteSandboxHandle
+	for attempt := 0; attempt < 2; attempt++ {
+		handle, err = m.resolveSession(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		err = m.writeSessionInputOnHandle(ctx, handle, clean, content)
+		if err == nil || attempt == 1 || !sessionBindingLost(err) {
+			return err
+		}
+		// The idle sweep can delete the container after resolve and before
+		// mkdir. The binding still points at that container, so drop it and
+		// provision once more.
+		if dropErr := m.dropBoundSandbox(ctx, sessionID, handle.ID()); dropErr != nil {
+			return err
+		}
 	}
+	return err
+}
+
+func (m *SessionBoundManager) writeSessionInputOnHandle(
+	ctx context.Context, handle RemoteSandboxHandle, clean string, content []byte,
+) error {
 	if err := ignoreExistingDir(m.client.MakeDir(ctx, handle, path.Dir(clean))); err != nil {
 		return fmt.Errorf("sandbox: create input directory: %w", err)
 	}
@@ -536,6 +555,33 @@ func (m *SessionBoundManager) WriteSessionInputFile(
 		return fmt.Errorf("sandbox: write session input %s: %w", clean, err)
 	}
 	return nil
+}
+
+// sessionBindingLost reports a sandbox that is gone. A missing path inside a
+// live container is also NotFound ("does not exist"); rebinding on that
+// would discard the session.
+func sessionBindingLost(err error) bool {
+	if !CanReplaceRemoteBinding(err) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "does not exist") && !strings.Contains(msg, "vanished") {
+		return false
+	}
+	return true
+}
+
+func (m *SessionBoundManager) dropBoundSandbox(ctx context.Context, sessionID, sandboxID string) error {
+	key, err := m.sessionKey(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	binding, err := m.bindings.Get(ctx, key)
+	if err != nil || binding == nil || binding.SandboxID != sandboxID || binding.Provider != m.client.Provider() {
+		return err
+	}
+	_, err = m.bindings.DeleteIfMatch(ctx, key, binding.Provider, binding.SandboxID)
+	return err
 }
 
 // WriteSessionWorkspaceFile writes a model-authored file into the session's
@@ -962,7 +1008,7 @@ func (m *SessionBoundManager) SessionFileStore() SessionFileStore {
 
 // SessionTerminalManager advertises the interactive-terminal capability while
 // a real remote backend is active and the provider implements PTY streaming
-// (E2B and Cube do; Docker does not).
+// (E2B, Cube and Docker all do).
 func (m *SessionBoundManager) SessionTerminalManager() SessionTerminalManager {
 	if m == nil || m.remoteDisabled() {
 		return nil
@@ -979,7 +1025,7 @@ func (m *SessionBoundManager) SessionTerminalManager() SessionTerminalManager {
 // entry point lacks the config-pin context that agent-driven creation
 // relies on. A bound sandbox that is not confirmed running returns
 // ErrSandboxPaused unless opts.AllowResume is set — Connect would wake a
-// paused instance. A backend that cannot stream PTYs (Docker) returns
+// paused instance. A backend that cannot stream PTYs returns
 // ErrTerminalUnsupported, not "no sandbox".
 func (m *SessionBoundManager) OpenSessionTerminal(
 	ctx context.Context,
@@ -1046,6 +1092,9 @@ func (m *SessionBoundManager) RequireRunningSessionSandbox(
 		return ErrNoLiveSessionSandbox
 	}
 	if state != RemoteStateRunning {
+		if m.client.Provider() == SandboxTypeDocker {
+			return ErrSandboxStopped
+		}
 		return ErrSandboxPaused
 	}
 	return nil
