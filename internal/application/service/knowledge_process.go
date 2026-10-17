@@ -769,11 +769,13 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			if isLikelyRateLimitError(err) {
 				code = werrors.ErrCodeEmbeddingRateLimit
 			}
-			s.failStage(ctx, knowledge.ID, types.StageEmbedding,
-				code, "batch index failed", err)
 			if willRetry {
+				s.failStageRetryable(ctx, knowledge.ID, types.StageEmbedding,
+					code, "batch index failed", err)
 				return fmt.Errorf("batch index: %w", err)
 			}
+			s.failStage(ctx, knowledge.ID, types.StageEmbedding,
+				code, "batch index failed", err)
 			return nil
 		}
 		logger.GetLogger(ctx).Infof("processChunks batch index successfully, with %d index", len(indexInfoList))
@@ -2821,10 +2823,15 @@ func (s *knowledgeService) reparseKnowledge(
 	// When the caller supplies new overrides (e.g. via the reparse confirm
 	// dialog), validate them against this knowledge's file type, then persist
 	// to metadata so both this call's enqueue and the worker re-read the same
-	// config. nil keeps whatever was stored at upload time.
+	// config. nil keeps whatever was stored at upload time. A snapshot that
+	// only repeats the current knowledge base is cleared, so the next edit
+	// of that setting is what reparse uses.
 	if processOverrides != nil {
-		if err := ValidateProcessOverrides(ctx, kb, processOverrides, reparseFileTypes(existing)); err != nil {
-			return nil, err
+		processOverrides = compactProcessOverrides(kb, processOverrides)
+		if processOverrides != nil {
+			if err := ValidateProcessOverrides(ctx, kb, processOverrides, reparseFileTypes(existing)); err != nil {
+				return nil, err
+			}
 		}
 		if err := existing.SetProcessOverrides(processOverrides); err != nil {
 			logger.Errorf(ctx, "Failed to set process overrides on reparse: %v", err)
@@ -4241,16 +4248,18 @@ func (s *knowledgeService) convert(
 	if !isURL {
 		fileReader, err := s.resolveFileServiceForPath(ctx, kb, payload.FilePath).GetFile(ctx, payload.FilePath)
 		if err != nil {
-			s.failStage(ctx, knowledge.ID, types.StageDocReader,
-				werrors.ErrCodeDocReaderParseFailed, "failed to get file", err)
-			return s.failKnowledge(ctx, knowledge, isLastRetry, "failed to get file: %v", err)
+			result, taskErr := s.failKnowledge(ctx, knowledge, isLastRetry, "failed to get file: %v", err)
+			s.failStageWithRetry(ctx, knowledge.ID, types.StageDocReader,
+				werrors.ErrCodeDocReaderParseFailed, "failed to get file", err, taskErr != nil)
+			return result, taskErr
 		}
 		defer fileReader.Close()
 		contentBytes, err := io.ReadAll(fileReader)
 		if err != nil {
-			s.failStage(ctx, knowledge.ID, types.StageDocReader,
-				werrors.ErrCodeDocReaderParseFailed, "failed to read file", err)
-			return s.failKnowledge(ctx, knowledge, isLastRetry, "failed to read file: %v", err)
+			result, taskErr := s.failKnowledge(ctx, knowledge, isLastRetry, "failed to read file: %v", err)
+			s.failStageWithRetry(ctx, knowledge.ID, types.StageDocReader,
+				werrors.ErrCodeDocReaderParseFailed, "failed to read file", err, taskErr != nil)
+			return result, taskErr
 		}
 		req.FileContent = contentBytes
 		req.FileName = payload.FileName
@@ -4261,9 +4270,10 @@ func (s *knowledgeService) convert(
 	if err != nil {
 		code, message := docReaderFailure(err)
 		logger.Errorf(ctx, "[convert] DocReader failed knowledge=%s code=%s: %v", knowledge.ID, code, err)
-		s.failStage(ctx, knowledge.ID, types.StageDocReader,
-			code, message, err)
-		return s.failKnowledge(ctx, knowledge, isLastRetry, "%s", message)
+		result, taskErr := s.failKnowledge(ctx, knowledge, isLastRetry, "%s", message)
+		s.failStageWithRetry(ctx, knowledge.ID, types.StageDocReader,
+			code, message, err, taskErr != nil)
+		return result, taskErr
 	}
 	sanitizeReadResult(result)
 	if result.Error != "" {
@@ -4443,20 +4453,21 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 		}
 
 		payload := types.ImageMultimodalPayload{
-			TenantID:          knowledge.TenantID,
-			KnowledgeID:       knowledge.ID,
-			KnowledgeBaseID:   kb.ID,
-			ChunkID:           chunkID,
-			ImageURL:          img.ServingURL,
-			EnableOCR:         true,
-			EnableCaption:     true,
-			ImageAttrsEnabled: eff.ImageAttrsEnabled,
-			ImageActions:      eff.ImageActions,
-			Language:          lang,
-			ImageSourceType:   metadata["image_source_type"],
-			Attempt:           attempt,
-			ImageIndex:        idx,
-			SourceLocators:    img.SourceLocators,
+			TenantID:            knowledge.TenantID,
+			KnowledgeID:         knowledge.ID,
+			KnowledgeBaseID:     kb.ID,
+			ChunkID:             chunkID,
+			ImageURL:            img.ServingURL,
+			ImagePipelineID:     eff.ImagePipelineID,
+			ImagePipelineParams: eff.ImagePipelineParams,
+			ImageAttrsEnabled:   eff.ImageAttrsEnabled,
+			ImageActions:        eff.ImageActions,
+			Language:            lang,
+			ImageSourceType:     metadata["image_source_type"],
+			Attempt:             attempt,
+			ImageIndex:          idx,
+			SourceLocators:      img.SourceLocators,
+			ImageVectorEnabled:  &eff.ImageVectorEnabled,
 		}
 
 		langfuse.InjectTracing(ctx, &payload)
