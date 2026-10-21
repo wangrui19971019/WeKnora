@@ -58,7 +58,8 @@ func (r *sourceRegistry) ModelOutput(result *types.ToolResult) string {
 		return annotateGraphResult(
 			r.modelKnowledgeOutput("graph", mapsValue(result.Data["results"]), result.Output), result.Data)
 	case "web_search_results":
-		return r.modelWebSearchOutput(mapsValue(result.Data["results"]), result.Output)
+		return annotateWebSearchNotes(
+			r.modelWebSearchOutput(mapsValue(result.Data["results"]), result.Output), result.Data)
 	case "database_query":
 		return r.modelDatabaseQueryOutput(mapsValue(result.Data["rows"]), result.Output)
 	default:
@@ -418,6 +419,25 @@ func annotateSearchNotes(output string, data map[string]interface{}) string {
 	return strings.TrimSuffix(output, "</retrieval>") + b.String() + "</retrieval>"
 }
 
+// annotateWebSearchNotes restates a clamped count inside the retrieval block.
+// web_search also writes the note into ToolResult.Output, but once there is at
+// least one row the model only sees this rendered view, so the note has to
+// travel in Data — the same reason annotateSearchNotes reads Data, not Output.
+func annotateWebSearchNotes(output string, data map[string]interface{}) string {
+	if !boolValue(data, "count_clamped") || !strings.HasSuffix(output, "</retrieval>") {
+		return output
+	}
+	requested := intValue(data, "count_requested")
+	maximum := intValue(data, "count_maximum")
+	if requested < 1 || maximum < 1 {
+		return output
+	}
+	note := fmt.Sprintf("  <count_clamped requested=\"%d\" maximum=\"%d\">The requested count is "+
+		"outside 1-%d and was clamped to %d. Ask for a value in range, or omit count to use the "+
+		"maximum.</count_clamped>\n", requested, maximum, maximum, maximum)
+	return strings.TrimSuffix(output, "</retrieval>") + note + "</retrieval>"
+}
+
 func viewForRow(row map[string]interface{}, mode string) string {
 	if stringValue(row, "content") != "" {
 		return "full"
@@ -459,7 +479,7 @@ func (r *sourceRegistry) modelKnowledgeChunksOutput(data map[string]interface{},
 			fmt.Fprintf(&b, "    <matches query=\"%s\" count=\"0\" />\n", escapeAttr(query))
 			b.WriteString("    <hint>No chunk contains every word of the query. Retry with fewer or different " +
 				"words (the document's own language and terms), or read a chunk from search_knowledge " +
-				"results with id=cN and context.</hint>\n")
+				"results with id=chunk://N and context.</hint>\n")
 		}
 		b.WriteString("  </document>\n</retrieval>")
 		return b.String()
@@ -724,7 +744,13 @@ func (r *sourceRegistry) modelWebFetchOutput(rows []map[string]interface{}, fall
 		if status == "" {
 			status = "success"
 		}
-		fmt.Fprintf(&b, "  <page id=\"%s\" status=\"%s\"", handle, escapeAttr(status))
+		if handle == "" {
+			// Unknown references must not become page IDs: a later real page may
+			// legitimately receive that ID in this registry.
+			fmt.Fprintf(&b, "  <page requested_reference=\"%s\" status=\"%s\"", escapeAttr(rawURL), escapeAttr(status))
+		} else {
+			fmt.Fprintf(&b, "  <page id=\"%s\" status=\"%s\"", escapeAttr(handle), escapeAttr(status))
+		}
 		if title != "" {
 			fmt.Fprintf(&b, " title=\"%s\"", escapeAttr(title))
 		}
