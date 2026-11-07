@@ -1,0 +1,18 @@
+{
+  "name": "WeKnora (Lite)",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "weknora-lite",
+      "command": "set -a && . ./.env.lite && set +a && exec ./WeKnora-lite",
+      "description": "WeKnora Lite backend + embedded Web UI on http://localhost:8080 (SQLite, in-memory queue, local storage). Register a user in the UI to get started; configure a model/Ollama for chat and add docreader for document ingestion."
+    }
+  ],
+  "ports": [
+    {
+      "name": "web",
+      "port": 8080
+    }
+  ]
+}
